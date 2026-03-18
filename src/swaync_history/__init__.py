@@ -3,32 +3,137 @@ import subprocess
 import json
 import os
 import time
+import sqlite3
+import base64
 import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 import notify2
 
-LOG_FILE = os.path.expanduser("~/.cache/swaync_history.json")
+DB_FILE = os.path.expanduser("~/.cache/swaync_history.db")
 INDEX_FILE = os.path.expanduser("~/.cache/swaync_pop_index")
+ICON_DIR = "/tmp/swaync-history/icons"
 MAX_NOTIFS = 100
 IGNORE_APP = "ReplayLogger"
+
+ICON_SIGNATURES = {
+    b"\x89PNG\r\n\x1a\n": "png",
+    b"\xff\xd8\xff": "jpg",
+    b"GIF87a": "gif",
+    b"GIF89a": "gif",
+    b"RIFF": "webp",
+    b"\x00\x00\x01\x00": "ico",
+    b"BM": "bmp",
+}
+
+
+def detect_image_type(data):
+    for sig, ext in ICON_SIGNATURES.items():
+        if data.startswith(sig):
+            return ext
+    return "png"
+
+
+def serialize_icon(path):
+    if not path:
+        return None, None
+    if path.startswith(("http://", "https://")):
+        return None, None
+    local_path = path.replace("file://", "")
+    if not os.path.isabs(local_path):
+        return None, None
+    try:
+        with open(local_path, "rb") as f:
+            data = f.read()
+        ext = detect_image_type(data)
+        return base64.b64encode(data).decode("utf-8"), ext
+    except (FileNotFoundError, PermissionError):
+        return None, None
+
+
+def deserialize_icon(icon_data, ext, notif_id):
+    if not icon_data:
+        return None
+    os.makedirs(ICON_DIR, exist_ok=True)
+    filename = f"notif_{notif_id}.{ext}"
+    filepath = os.path.join(ICON_DIR, filename)
+    data = base64.b64decode(icon_data)
+    with open(filepath, "wb") as f:
+        f.write(data)
+    return filepath
+
+
+def get_db():
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            app_name TEXT,
+            replaces_id INTEGER,
+            app_icon TEXT,
+            icon_data TEXT,
+            summary TEXT,
+            body TEXT,
+            actions TEXT,
+            hints TEXT,
+            expire_timeout INTEGER,
+            timestamp REAL
+        )
+    """)
+    try:
+        conn.execute("ALTER TABLE notifications ADD COLUMN icon_data TEXT")
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+    return conn
 
 
 def save_notif(notif):
     if notif.get("app_name") == IGNORE_APP:
         return
 
-    with open(LOG_FILE, "a") as f:
-        f.write(json.dumps(notif) + "\n")
+    icon_path = notif.get("app_icon") or ""
+    hints = notif.get("hints", {})
 
-    try:
-        with open(LOG_FILE, "r") as f:
-            lines = f.readlines()
-        if len(lines) > MAX_NOTIFS:
-            with open(LOG_FILE, "w") as f:
-                f.writelines(lines[-MAX_NOTIFS:])
-    except FileNotFoundError:
-        pass
+    for hint_key in ["image-path", "image_path", "icon_data"]:
+        if hint_key in hints:
+            icon_path = hints[hint_key]
+            break
+
+    icon_data, icon_ext = serialize_icon(icon_path)
+    if icon_data:
+        icon_data = f"{icon_ext}:{icon_data}"
+
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO notifications
+        (app_name, replaces_id, app_icon, icon_data, summary, body, actions, hints, expire_timeout, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            notif["app_name"],
+            notif["replaces_id"],
+            notif["app_icon"],
+            icon_data,
+            notif["summary"],
+            notif["body"],
+            json.dumps(notif["actions"]),
+            json.dumps(notif["hints"]),
+            notif["expire_timeout"],
+            notif["timestamp"],
+        ),
+    )
+
+    conn.execute(
+        "DELETE FROM notifications WHERE id NOT IN "
+        "(SELECT id FROM notifications ORDER BY timestamp DESC LIMIT ?)",
+        (MAX_NOTIFS,),
+    )
+    conn.commit()
+    conn.close()
 
 
 def notify_handler(
@@ -37,20 +142,8 @@ def notify_handler(
     if app_name == IGNORE_APP:
         return
 
-    notif = {
-        "app_name": app_name,
-        "replaces_id": replaces_id,
-        "app_icon": app_icon,
-        "summary": summary,
-        "body": body,
-        "actions": list(actions) if actions else [],
-        "hints": dict(hints) if hints else {},
-        "expire_timeout": expire_timeout,
-        "timestamp": time.time(),
-    }
-
     hints_clean = {}
-    for key, value in notif["hints"].items():
+    for key, value in (hints or {}).items():
         if isinstance(value, dbus.Boolean):
             hints_clean[key] = bool(value)
         elif isinstance(value, dbus.Int32):
@@ -65,13 +158,24 @@ def notify_handler(
             hints_clean[key] = str(value)
         else:
             hints_clean[key] = str(value)
-    notif["hints"] = hints_clean
+
+    notif = {
+        "app_name": app_name,
+        "replaces_id": replaces_id,
+        "app_icon": app_icon,
+        "summary": summary,
+        "body": body,
+        "actions": list(actions) if actions else [],
+        "hints": hints_clean,
+        "expire_timeout": expire_timeout,
+        "timestamp": time.time(),
+    }
 
     save_notif(notif)
 
 
 def run_daemon():
-    print(f"Started Notification Logger (saving to {LOG_FILE})")
+    print(f"Started Notification Logger (saving to {DB_FILE})")
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
 
     bus = dbus.SessionBus()
@@ -143,39 +247,65 @@ def send_notification(
     n.show()
 
 
-def pop(direction="back"):
+def get_position():
     try:
         if time.time() - os.path.getmtime(INDEX_FILE) > 15:
-            idx = 0
-        else:
-            with open(INDEX_FILE, "r") as f:
-                idx = int(f.read().strip())
+            return 0
+        with open(INDEX_FILE, "r") as f:
+            return int(f.read().strip())
     except (FileNotFoundError, ValueError):
-        idx = 0
+        return 0
+
+
+def set_position(idx):
+    with open(INDEX_FILE, "w") as f:
+        f.write(str(idx))
+
+
+def get_icon_for_replay(icon_data, notif_id, original_icon):
+    if icon_data:
+        ext, data = icon_data.split(":", 1)
+        filepath = deserialize_icon(data, ext, notif_id)
+        if filepath:
+            return filepath
+    if original_icon and not original_icon.startswith(("http://", "https://")):
+        return original_icon
+    return None
+
+
+def pop(direction="back"):
+    idx = get_position()
 
     if direction == "forward":
         if idx > 0:
             subprocess.run(["swaync-client", "--hide-latest"])
-            idx -= 1
-            with open(INDEX_FILE, "w") as f:
-                f.write(str(idx))
+            set_position(idx - 1)
         return
 
     idx += 1
 
-    try:
-        with open(LOG_FILE, "r") as f:
-            logs = [json.loads(line) for line in f if line.strip()]
-    except (FileNotFoundError, json.JSONDecodeError):
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0]
+
+    if idx > total:
+        idx = total
+
+    if idx < 1:
+        conn.close()
         return
 
-    if idx > len(logs):
-        idx = len(logs)
+    row = conn.execute(
+        "SELECT * FROM notifications ORDER BY timestamp DESC LIMIT 1 OFFSET ?",
+        (idx - 1,),
+    ).fetchone()
+    conn.close()
 
-    if not logs:
+    if not row:
         return
 
-    log = logs[-idx]
+    log = dict(row)
+    log["actions"] = json.loads(log["actions"]) if log["actions"] else []
+    log["hints"] = json.loads(log["hints"]) if log["hints"] else {}
 
     summary = f"[History: {idx}] {log.get('summary', '')}"
     body = log.get("body", "")
@@ -185,31 +315,42 @@ def pop(direction="back"):
     if "urgency" in hints:
         urgency = hints.pop("urgency")
 
+    icon = get_icon_for_replay(log.get("icon_data"), log["id"], log.get("app_icon"))
+
     send_notification(
         summary=summary,
         body=body,
         app_name=log.get("app_name"),
-        icon=log.get("app_icon"),
+        icon=icon,
         hints=hints,
         actions=log.get("actions"),
         expire_timeout=log.get("expire_timeout", -1),
         urgency=urgency,
     )
 
-    with open(INDEX_FILE, "w") as f:
-        f.write(str(idx))
+    set_position(idx)
 
 
 def replay(count):
-    try:
-        with open(LOG_FILE, "r") as f:
-            logs = [json.loads(line) for line in f if line.strip()]
-    except (FileNotFoundError, json.JSONDecodeError):
-        return
+    conn = get_db()
 
-    to_replay = logs[-count:] if count > 0 else logs
+    if count > 0:
+        rows = conn.execute(
+            "SELECT * FROM notifications ORDER BY timestamp DESC LIMIT ?",
+            (count,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM notifications ORDER BY timestamp DESC"
+        ).fetchall()
 
-    for log in to_replay:
+    conn.close()
+
+    for row in rows:
+        log = dict(row)
+        log["actions"] = json.loads(log["actions"]) if log["actions"] else []
+        log["hints"] = json.loads(log["hints"]) if log["hints"] else {}
+
         summary = f"[replay: {log.get('app_name', 'Unknown')}] {log.get('summary', '')}"
         body = log.get("body", "")
 
@@ -218,11 +359,13 @@ def replay(count):
         if "urgency" in hints:
             urgency = hints.pop("urgency")
 
+        icon = get_icon_for_replay(log.get("icon_data"), log["id"], log.get("app_icon"))
+
         send_notification(
             summary=summary,
             body=body,
             app_name=log.get("app_name"),
-            icon=log.get("app_icon"),
+            icon=icon,
             hints=hints,
             actions=log.get("actions"),
             expire_timeout=log.get("expire_timeout", -1),

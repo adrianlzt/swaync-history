@@ -38,5 +38,5 @@ Add to your waybar config:
 
 ## Files
 
-- `~/.cache/swaync_history.json` - NDJSON file with notification history
+- `~/.cache/swaync_history.db` - SQLite database with notification history
 - `~/.cache/swaync_pop_index` - Current scroll position
