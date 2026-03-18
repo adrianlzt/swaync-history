@@ -59,11 +59,30 @@ swaync-history pop forward
 Add a custom module to your waybar config:
 
 ```json
-"custom/notification-scroll": {
-    "format": "notif",
-    "on-scroll-up": "swaync-history pop forward",
-    "on-scroll-down": "swaync-history pop back",
-    "tooltip": false
+{
+  "custom/notification": {
+    "tooltip": true,
+    "format": "<span size='16pt'>{icon}</span>",
+    "min-length": 4,
+    "format-icons": {
+      "notification": "󱅫",
+      "none": "󰂜",
+      "dnd-notification": "󰂠",
+      "dnd-none": "󰪓",
+      "inhibited-notification": "󰂛",
+      "inhibited-none": "󰪑",
+      "dnd-inhibited-notification": "󰂛",
+      "dnd-inhibited-none": "󰪑"
+    },
+    "return-type": "json",
+    "exec-if": "which swaync-client",
+    "exec": "swaync-client -swb",
+    "on-click": "swaync-client -t -sw",
+    "on-click-right": "swaync-client -d -sw",
+    "on-scroll-up": "uv run --directory ~/.config/swaync swaync-history pop forward",
+    "on-scroll-down": "uv run --directory ~/.config/swaync swaync-history pop back",
+    "escape": true
+  }
 }
 ```
 
