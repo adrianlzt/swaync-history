@@ -232,7 +232,7 @@ def replay(count):
 
 
 def main():
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("Usage: swaync-history <command> [args]")
         print("Commands:")
         print("  daemon        Start the notification logger daemon")
@@ -240,7 +240,7 @@ def main():
         print(
             "  pop [dir]     Pop notification (direction: back/forward, default: back)"
         )
-        sys.exit(1)
+        sys.exit(0)
 
     command = sys.argv[1]
 
