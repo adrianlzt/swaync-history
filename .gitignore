@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.git/
+.venv/
+dist/
+*.egg-info/
+
+style.css
